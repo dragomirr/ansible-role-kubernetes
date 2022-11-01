@@ -1,0 +1,194 @@
+---
+- name: Load modules
+  become: true
+  community.general.modprobe:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - overlay
+    - br_netfilter
+
+- name: Load modules on system boot
+  become: true
+  ansible.builtin.copy:
+    src: etc/modules-load.d/containerd.conf
+    dest: /etc/modules-load.d/containerd.conf
+    mode: 0644
+    owner: root
+    group: root
+
+- name: Unmount swap partitions
+  become: true
+  ansible.builtin.command:
+    cmd: swapoff -a
+  changed_when: false
+  when: kubernetes_swap_disable|bool
+
+- name: Remove swap from fstab
+  become: true
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    regexp: "swap"
+    state: absent
+  when: kubernetes_swap_disable|bool
+
+- name: Add networking kernel configuration
+  become: true
+  ansible.posix.sysctl:
+    name: "{{ item }}"
+    value: '1'
+    sysctl_set: true
+    sysctl_file: /etc/sysctl.d/99-kubernetes-cri.conf
+  loop:
+    - net.bridge.bridge-nf-call-iptables
+    - net.bridge.bridge-nf-call-ip6tables
+    - net.ipv4.ip_forward
+
+- name: Install containerd
+  become: true
+  ansible.builtin.apt:
+    name: containerd
+    state: present
+    update_cache: true
+  retries: 3
+  delay: 5
+
+- name: Ensure containerd directory is created
+  become: true
+  ansible.builtin.file:
+    path: /etc/containerd
+    mode: 0755
+    state: directory
+    owner: root
+    group: root
+
+- name: Create containerd configuration
+  become: true
+  ansible.builtin.shell:
+    cmd: containerd config default | tee /etc/containerd/config.toml
+  args:
+    creates: /etc/containerd/config.toml
+
+- name: Make sure containerd is started and enabled
+  become: true
+  ansible.builtin.systemd:
+    name: containerd
+    state: started
+    enabled: true
+
+- name: Install dependencies
+  become: true
+  ansible.builtin.apt:
+    name:
+      - apt-transport-https
+      - curl
+    state: present
+    update_cache: true
+  retries: 3
+  delay: 5
+
+- name: Add kubernetes repository gpg key
+  become: true
+  ansible.builtin.apt_key:
+    url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+    state: present
+  retries: 3
+  delay: 5
+
+- name: Add kubernetes repository
+  become: true
+  ansible.builtin.apt_repository:
+    repo: deb https://apt.kubernetes.io/ kubernetes-xenial main
+    filename: kubernetes.list
+    state: present
+
+- name: Add kubelet config
+  become: true
+  ansible.builtin.copy:
+    content: KUBELET_CONFIG_ARGS={{ kubernetes_kubelet_config_args | join(" ")}}
+    dest: /etc/default/kubelet
+  when: kubernetes_kubelet_config_args is defined and kubernetes_kubelet_config_args|length
+  notify: Restart kubelet
+
+- ansible.builtin.meta: flush_handlers
+
+- name: Install kubernetes packages
+  become: true
+  ansible.builtin.apt:
+    name: "{{ kubernetes_packages | product([kubernetes_version ~ '-00']) | map('join', '=') }}"
+    state: present
+    update_cache: true
+    allow_change_held_packages: "{{ kubernetes_allow_change_held_packages | default(omit) }}"
+  retries: 3
+  delay: 5
+
+- name: Ensure kubelet is started and enabled
+  become: true
+  ansible.builtin.systemd:
+    name: kubelet
+    state: started
+    enabled: true
+
+- name: Disable update of kubernetes packages
+  become: true
+  ansible.builtin.command:
+    cmd: apt-mark hold {{ kubernetes_packages | join(' ') }}
+  register: kubernetes__reg_hold_packages
+  changed_when: "'already' not in kubernetes__reg_hold_packages.stdout"
+
+- name: Initialize cluster
+  become: true
+  ansible.builtin.command:
+    cmd: >
+      kubeadm init
+      --pod-network-cidr {{ kubernetes_pod_network_cidr }}
+      --kubernetes-version {{ kubernetes_version }}
+      {% if kubernetes_apiserver_advertise_address is defined and kubernetes_apiserver_advertise_address|length %}
+      --apiserver-advertise-address={{ kubernetes_apiserver_advertise_address }}
+      {% endif %}
+  when: kubernetes_control_plane|bool and kubernetes_init|bool
+
+- name: Wait for cluster to become operational
+  ansible.builtin.wait_for:
+    port: 6443
+    delay: 10
+    timeout: 300
+  when: kubernetes_control_plane|bool
+
+- name: Install {{ kubernetes_network_plugin }} network plugin
+  become: true
+  ansible.builtin.command:
+    cmd: kubectl apply -f {{ kubernetes_network_plugins[kubernetes_network_plugin] }}
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  when: kubernetes_control_plane|bool and kubernetes_init|bool
+  retries: 3
+  delay: 5
+
+- name: Get join parameters
+  become: true
+  ansible.builtin.command:
+    cmd: kubeadm token create --print-join-command
+  register: kubernetes__reg_join_command
+  when: kubernetes_control_plane|bool and kubernetes_init|bool
+
+- name: Add workers to group
+  ansible.builtin.add_host:
+    name: "{{ item }}"
+    groups: kubernetes_workers_group
+  when: hostvars[item].kubernetes_control_plane is not defined and kubernetes_init|bool
+  loop: "{{ ansible_play_hosts }}"
+
+- name: Set join command
+  ansible.builtin.set_fact:
+    kubernetes__fact_join_command: "{{ kubernetes__reg_join_command.stdout }}"
+  delegate_to: "{{ item }}"
+  delegate_facts: true
+  when: kubernetes_control_plane|bool and kubernetes_init|bool
+  loop: "{{ groups.kubernetes_workers_group }}"
+
+- name: Join worker nodes to cluster
+  become: true
+  ansible.builtin.command:
+    cmd: "{{ kubernetes__fact_join_command }}"
+  when: not kubernetes_control_plane|bool and kubernetes_init|bool

@@ -1,0 +1,14 @@
+---
+kubernetes_version: 1.25.3
+kubernetes_packages:
+  - kubelet
+  - kubeadm
+  - kubectl
+kubernetes_pod_network_cidr: 10.244.0.0/16
+kubernetes_network_plugin: flannel
+kubernetes_control_plane: false
+kubernetes_init: false
+kubernetes_swap_disable: true
+kubernetes_kubelet_config_args: []
+  #- --config=/var/lib/kubelet/config.yaml
+  #- --node-ip={{ inventory_hostname }} # useful for vagrant deployments or when kubelet picks wrong ip/interface

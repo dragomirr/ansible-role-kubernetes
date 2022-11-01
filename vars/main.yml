@@ -1,0 +1,4 @@
+---
+kubernetes_network_plugins:
+  calico: https://docs.projectcalico.org/manifests/calico.yaml
+  flannel: https://github.com/coreos/flannel/raw/master/Documentation/kube-flannel.yml
